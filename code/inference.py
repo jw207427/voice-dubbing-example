@@ -28,58 +28,40 @@ def model_fn(model_dir):
     """
     # List all the folders located in '/ml/opt/model
     model_folders = os.listdir(model_dir)
-    logger.info(f"Found the following models: {model_folders}")
+    print(f"Found the following models: {model_folders}")
     
     
-    logger.info("Loading model")
+    print("Loading model ===============")
     model = api.TextToSpeech(half=HALF, kv_cache=KV_CACHE, use_deepspeed=USE_DEEPSPEED, models_dir=model_dir)
-    logger.info("Model loaded")
+    
+    print("Model loaded =================")
     
     return model
-
-def download_get_conditioning_latents(model, voice_samples):
-    """
-    Download voice samples from S3 and compute conditioning latents
-
-    Args:
-        model (Tortoise): The Tortoise model to load the weights into.
-        voice_samples_s3_uri (str): The S3 URI for the voice samples.
-    """
-
-    logger.info("load voice samples")
-
-    # Load all voice sample files
-    voice_samples_dir = f"samples/{voice_samples}"
-    voice_samples = []
-    for filename in os.listdir(voice_samples_dir):
-        voice_samples.append(audio.load_audio(os.path.join(voice_samples_dir, 
-                                                           filename), 
-                                              22050))
-
-    logger.info("Computing conditioning latents")
-    # Compute conditioning latentstents for the given voice samples.
-    conditioning_latents = model.get_conditioning_latents(voice_samples)
-    logger.info("Conditioning latents computed")
-    
-    return conditioning_latents
     
 def predict_fn(input_data, model):
     """
     Run prediction on input data
     """
+
+    samples_dir = os.path.join(MODEL_DIR, 'code/samples')
     
-    if input_data['voice_samples']:
-        conditioning_latents = download_get_conditioning_latents(model, input_data['voice_samples'])
+    voice_samples = []
+
+    voice_samples_dir = os.path.join(samples_dir, input_data['voice_id'])
+
+    print(f"List voice sample id dir: {os.listdir(voice_samples_dir)}")
+
+    for filename in os.listdir(voice_samples_dir):
+        print(f"processing {filename}")
+        voice_samples.append(audio.load_audio(os.path.join(voice_samples_dir, filename), 22050))
     
-    logger.info("Generating with params: %s", input_data)
+    conditioning_latents = model.get_conditioning_latents(voice_samples)
+    
+    print("Generating with params: %s", input_data)
 
     # Synthesize
-    if input_data['voice_samples']:
-        audio_clip = model.tts(input_data['text'], voice_samples=None,
-                               conditioning_latents=conditioning_latents).squeeze(0).cpu()
-    else:
-        audio_clip = model.tts_with_preset(input_data['text'],
-                                           preset="fast").squeeze(0).cpu()
+    audio_clip = model.tts(input_data['text'], voice_samples=None,
+                           conditioning_latents=conditioning_latents).squeeze(0).cpu()
 
     # create a BytesIO object
     buffer = io.BytesIO()
@@ -87,8 +69,21 @@ def predict_fn(input_data, model):
     # Save to temporary file
     torchaudio.save(buffer, audio_clip, 24000, format="wav")
 
+    # Configure boto3 client
+    session = boto3.Session()
+    s3_client = session.client('s3')
+
+    # Important: Seek to the beginning of the buffer
+    buffer.seek(0)
+    
+    # Upload the file
+    s3_client.upload_fileobj(buffer, input_data['output_bucket'], input_data['output_key'])
+
+    output_path = f"s3://{input_data['output_bucket']}/{input_data['output_key']}"
+    print(f"uploaded the file to {output_path}")
+
     # Return the butes from the BytesIO object
-    return buffer.getvalue()
+    return output_path
 
 
 def input_fn(request_body, request_content_type):
@@ -112,7 +107,8 @@ def input_fn(request_body, request_content_type):
         ValueError: If any required fields are missing or invalid in the request body.
     """
 
-    logger.info('Received input: %s', request_body)
+    print('Received input: %s', request_body)
+    
     if request_content_type == "application/json":
         try:
             request = json.loads(request_body)
@@ -121,19 +117,21 @@ def input_fn(request_body, request_content_type):
     else:
         raise ValueError("Unsupported content type: {}".format(request_content_type))
 
+
     # Extract and validate required fields
-    required_fields = ["text", "voice_samples"]
+    required_fields = ["text", "output_bucket", "output_key"]
     missing_fields = [field for field in required_fields if field not in request]
     if missing_fields:
         raise ValueError(f"Missing required fields: {', '.join(missing_fields)}")
 
+
     # Extract and handle optional fields with defaults
     return {
-        "text": request["text"],
-        "voice_samples": request.get("voice_samples", None),
-        "inference_params": request.get("inference_params", {}),
+        "text": request.get("text", ""),
+        "voice_id": request.get("voice_id", "male_voice"),
+        "output_bucket": request.get("output_bucket"),
+        "output_key": request.get("output_key")
     }
-
 
 def output_fn(response_body, response_content_type):
 
@@ -141,7 +139,7 @@ def output_fn(response_body, response_content_type):
     Serialize and prepare the prediction output
     """
 
-    logger.info('Returning response')
+    print('Returning response ===============')
     return {
         "statusCode": 200,
         "body": response_body}
